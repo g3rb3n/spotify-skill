@@ -289,72 +289,6 @@ class SpotifySkill(CommonPlaySkill):
         self.DEFAULT_VOLUME = 80
         self._playlists = None
 
-    def handle_error(self, e):
-        self.speak_dialog('Error', data={'error':e})
-        LOG.error(e)
-        return True
-
-    def librespot_enabled(self):
-        if platform == 'mycroft_mark_1':
-            return True
-        if self.settings.get('librespot_path', None):
-            return True
-        return False
-
-    def launch_librespot(self):
-        """ Launch the librespot binary for the Mark-1.
-        TODO: Discovery mode
-        """
-        if not self.librespot_enabled()
-            return
-        self.librespot_starting = True
-        platform = self.config_core.get('enclosure').get('platform', 'unknown')
-        path = self.settings.get('librespot_path', None)
-        if platform == 'mycroft_mark_1' and not path:
-            path = 'librespot'
-
-        if not path:
-            self.librespot_starting = False
-            LOG.info('No libreSpot path specified')
-            return
-        if not self.device_name:
-            self.librespot_starting = False
-            LOG.error('No device name specified')
-            return
-        if not 'user' in self.settings:
-            self.librespot_starting = False
-            LOG.error('No user name specified')
-            return
-        if not 'password' in self.settings:
-            self.librespot_starting = False
-            LOG.error('No password specified')
-            return
-
-        # Disable librespot logging if not specifically requested
-        outs = None if 'librespot_log' in self.settings else DEVNULL
-
-        # TODO: Error message when provided username/password don't work
-        self.process = Popen([path, '-n', self.device_name,
-                              '-u', self.settings['user'],
-                              '-p', self.settings['password']],
-                              stdout=outs, stderr=outs)
-
-        time.sleep(3)  # give libreSpot time to start-up
-        if self.process and self.process.poll() is not None:
-            # libreSpot shut down immediately.  Bad user/password?
-            #if self.settings['user']:
-            LOG.error('Failed to start LibreSpot')
-            self.speak_dialog("FailedToStart")
-            self.process = None
-            self.librespot_starting = False
-            return
-
-        # Lower the volume since max volume sounds terrible on the Mark-1
-        dev = self.device_by_name(self.device_name)
-        if dev:
-            self.spotify.volume(dev['id'], self.DEFAULT_VOLUME)
-        self.librespot_starting = False
-
     def initialize(self):
         # Make sure the spotify login scheduled event is shutdown
         super().initialize()
@@ -421,6 +355,195 @@ class SpotifySkill(CommonPlaySkill):
         # Should be safe to set device_name here since home has already
         # been connected
         self.device_name = DeviceApi().get().get('name')
+
+    def shutdown(self):
+        """ Remove the monitor at shutdown. """
+        self.cancel_scheduled_event('SpotifyLogin')
+        self.stop_monitor()
+        self.stop_librespot()
+
+        # Do normal shutdown procedure
+        super(SpotifySkill, self).shutdown()
+
+    ######################################################################
+    # Utility.
+
+    def handle_error(self, e):
+        """ Handle error, speak and log """
+        self.speak_dialog('Error', data={'error':e})
+        LOG.error(e)
+        return True
+
+    @property
+    def playlists(self):
+        """ Playlists, cached for 5 minutes """
+        if not self.spotify:
+            return []  # No connection, no playlists
+        now = time.time()
+        if not self._playlists or (now - self.__playlists_fetched > 5 * 60):
+            self._playlists = {}
+            playlists = self.spotify.current_user_playlists().get('items', [])
+            for p in playlists:
+                self._playlists[p['name'].lower()] = p
+            self.__playlists_fetched = now
+        return self._playlists
+
+    @property
+    def devices(self):
+        """ Devices, cached for 60 seconds """
+        if not self.spotify:
+            return []  # No connection, no devices
+        now = time.time()
+        if not self.__device_list or (now - self.__devices_fetched > 60):
+            self.__device_list = self.spotify.get_devices()
+            self.__devices_fetched = now
+        return self.__device_list
+
+    def device_by_name(self, name):
+        """ Get a Spotify devices from the API
+
+        Args:
+            name (str): The device name (fuzzy matches)
+        Returns:
+            (dict) None or the matching device's description
+        """
+        if not self.devices:
+            return None
+        devices = self.devices
+        # Otherwise get a device with the selected name
+        devices_by_name = {d['name']: d for d in devices}
+        key, confidence = match_one(name, list(devices_by_name.keys()))
+        if confidence > 0.5:
+            return devices_by_name[key]
+        return None
+
+    def get_default_device(self):
+        """ Get preferred playback device """
+        if self.spotify:
+            # When there is an active Spotify device somewhere, use it
+            if (self.devices and len(self.devices) > 0 and
+                    self.spotify.is_playing()):
+                for dev in self.devices:
+                    if dev['is_active']:
+                        return dev  # Use this device
+
+            # No playing device found, use the default Spotify device
+            default_device_name = self.settings.get('default_device', '')
+            dev = None
+            if default_device_name:
+                dev = self.device_by_name(default_device_name)
+            # if not set or missing try playing on this device
+            if not dev:
+                dev = self.device_by_name(self.device_name)
+            # if not check if a desktop spotify client is playing
+            if not dev:
+                dev = self.device_by_name(gethostname())
+            # use first best device if none of the prioritized works
+            if not dev and len(self.devices) > 0:
+                dev = self.devices[0]
+            if dev and not dev['is_active']:
+                self.spotify.transfer_playback(dev['id'], False)
+            return dev
+
+        return None
+
+    def get_best_playlist(self, playlist):
+        """ Get best playlist matching the provided name
+
+        Arguments:
+            playlist (str): Playlist name
+
+        Returns: (str) best match
+        """
+        key, confidence = match_one(playlist.lower(),
+                                    list(self.playlists.keys()))
+        if confidence > 0.7:
+            return key, confidence
+        else:
+            return None, 0
+
+    ######################################################################
+    # LibreSpot.
+
+    def librespot_enabled(self):
+        if platform == 'mycroft_mark_1':
+            return True
+        if self.settings.get('librespot_path', None):
+            return True
+        return False
+
+    def wait_for_librespot(self):
+        """ Wait for LibreSpot to start """
+        for i in range(10):
+            if not self.librespot_starting:
+                break
+            self.log.info('Librespot is starting...')
+            time.sleep(0.5)
+        if self.librespot_starting:
+            self.log.error('LIBRESPOT NOT STARTED')
+
+
+    def launch_librespot(self):
+        """ Launch the librespot binary for the Mark-1.
+        TODO: Discovery mode
+        """
+        if not self.librespot_enabled():
+            return
+        self.librespot_starting = True
+        platform = self.config_core.get('enclosure').get('platform', 'unknown')
+        path = self.settings.get('librespot_path', None)
+        if platform == 'mycroft_mark_1' and not path:
+            path = 'librespot'
+
+        if not path:
+            self.librespot_starting = False
+            LOG.info('No libreSpot path specified')
+            return
+        if not self.device_name:
+            self.librespot_starting = False
+            LOG.error('No device name specified')
+            return
+        if not 'user' in self.settings:
+            self.librespot_starting = False
+            LOG.error('No user name specified')
+            return
+        if not 'password' in self.settings:
+            self.librespot_starting = False
+            LOG.error('No password specified')
+            return
+
+        # Disable librespot logging if not specifically requested
+        outs = None if 'librespot_log' in self.settings else DEVNULL
+
+        # TODO: Error message when provided username/password don't work
+        self.process = Popen([path, '-n', self.device_name,
+                              '-u', self.settings['user'],
+                              '-p', self.settings['password']],
+                              stdout=outs, stderr=outs)
+
+        time.sleep(3)  # give libreSpot time to start-up
+        if self.process and self.process.poll() is not None:
+            # libreSpot shut down immediately.  Bad user/password?
+            #if self.settings['user']:
+            LOG.error('Failed to start LibreSpot')
+            self.speak_dialog("FailedToStart")
+            self.process = None
+            self.librespot_starting = False
+            return
+
+        # Lower the volume since max volume sounds terrible on the Mark-1
+        dev = self.device_by_name(self.device_name)
+        if dev:
+            self.spotify.volume(dev['id'], self.DEFAULT_VOLUME)
+        self.librespot_starting = False
+
+    def stop_librespot(self):
+        """ Send Terminate signal to librespot if it's running. """
+        if self.process and self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+            self.process.communicate()  # Communicate to remove zombie
+            self.process = None
+
 
     ######################################################################
     # Handle auto ducking when listener is started.
@@ -508,6 +631,14 @@ class SpotifySkill(CommonPlaySkill):
 
     ######################################################################
     # Intent handling
+
+    def create_intents(self):
+        # Create intents
+        intent = IntentBuilder('').require('Spotify').require('Search') \
+                                  .require('For')
+        self.register_intent(intent, self.search_spotify)
+        self.register_intent_file('ShuffleOn.intent', self.shuffle_on)
+        self.register_intent_file('ShuffleOff.intent', self.shuffle_off)
 
     def CPS_match_query_phrase(self, phrase):
         # Not ready to play
@@ -632,16 +763,6 @@ class SpotifySkill(CommonPlaySkill):
                     })
         return None, None
 
-    def wait_for_librespot(self):
-        """ Wait for LibreSpot to start """
-        for i in range(10):
-            if not self.librespot_starting:
-                break
-            self.log.info('Librespot is starting...')
-            time.sleep(0.5)
-        if self.librespot_starting:
-            self.log.error('LIBRESPOT NOT STARTED')
-
     def CPS_start(self, phrase, data):
         self.wait_for_librespot()
         dev = self.get_default_device()
@@ -657,102 +778,6 @@ class SpotifySkill(CommonPlaySkill):
                 self.play(data=data['data'], data_type=data['type'])
             except:
                 self.log.exception()
-
-    def create_intents(self):
-        # Create intents
-        intent = IntentBuilder('').require('Spotify').require('Search') \
-                                  .require('For')
-        self.register_intent(intent, self.search_spotify)
-        self.register_intent_file('ShuffleOn.intent', self.shuffle_on)
-        self.register_intent_file('ShuffleOff.intent', self.shuffle_off)
-
-    @property
-    def playlists(self):
-        """ Playlists, cached for 5 minutes """
-        if not self.spotify:
-            return []  # No connection, no playlists
-        now = time.time()
-        if not self._playlists or (now - self.__playlists_fetched > 5 * 60):
-            self._playlists = {}
-            playlists = self.spotify.current_user_playlists().get('items', [])
-            for p in playlists:
-                self._playlists[p['name'].lower()] = p
-            self.__playlists_fetched = now
-        return self._playlists
-
-    @property
-    def devices(self):
-        """ Devices, cached for 60 seconds """
-        if not self.spotify:
-            return []  # No connection, no devices
-        now = time.time()
-        if not self.__device_list or (now - self.__devices_fetched > 60):
-            self.__device_list = self.spotify.get_devices()
-            self.__devices_fetched = now
-        return self.__device_list
-
-    def device_by_name(self, name):
-        """ Get a Spotify devices from the API
-
-        Args:
-            name (str): The device name (fuzzy matches)
-        Returns:
-            (dict) None or the matching device's description
-        """
-        if not self.devices:
-            return None
-        devices = self.devices
-        # Otherwise get a device with the selected name
-        devices_by_name = {d['name']: d for d in devices}
-        key, confidence = match_one(name, list(devices_by_name.keys()))
-        if confidence > 0.5:
-            return devices_by_name[key]
-        return None
-
-    def get_default_device(self):
-        """ Get preferred playback device """
-        if self.spotify:
-            # When there is an active Spotify device somewhere, use it
-            if (self.devices and len(self.devices) > 0 and
-                    self.spotify.is_playing()):
-                for dev in self.devices:
-                    if dev['is_active']:
-                        return dev  # Use this device
-
-            # No playing device found, use the default Spotify device
-            default_device_name = self.settings.get('default_device', '')
-            dev = None
-            if default_device_name:
-                dev = self.device_by_name(default_device_name)
-            # if not set or missing try playing on this device
-            if not dev:
-                dev = self.device_by_name(self.device_name)
-            # if not check if a desktop spotify client is playing
-            if not dev:
-                dev = self.device_by_name(gethostname())
-            # use first best device if none of the prioritized works
-            if not dev and len(self.devices) > 0:
-                dev = self.devices[0]
-            if dev and not dev['is_active']:
-                self.spotify.transfer_playback(dev['id'], False)
-            return dev
-
-        return None
-
-    def get_best_playlist(self, playlist):
-        """ Get best playlist matching the provided name
-
-        Arguments:
-            playlist (str): Playlist name
-
-        Returns: (str) best match
-        """
-        key, confidence = match_one(playlist.lower(),
-                                    list(self.playlists.keys()))
-        if confidence > 0.7:
-            return key, confidence
-        else:
-            return None, 0
 
     def continue_current_playlist(self, message):
         if not self.playback_prerequisits_ok():
@@ -943,6 +968,27 @@ class SpotifySkill(CommonPlaySkill):
             return
         self.spotify.shuffle(False)
 
+    def stop(self):
+        """ Stop playback. """
+        if not self.spotify:
+            self.dev_id = None
+            self.speak_dialog('NotConnected')
+            return False
+        if not self.spotify.is_playing():
+            self.dev_id = None
+            self.speak_dialog('NotPlaying')
+            LOG.info('Not playing')
+            return False
+        dev = self.get_default_device()
+        if not dev:
+            self.speak_dialog('DeviceNotFound', data={'device':'default'})
+            return False
+        self.dev_id = dev['id']
+        self.pause(None)
+        # Clear playing device id
+        self.dev_id = None
+        return True
+
     def __pause(self):
         # if authorized and playback was started by the skill
         if not self.spotify:
@@ -1031,43 +1077,6 @@ class SpotifySkill(CommonPlaySkill):
         LOG.debug(dev['id'])
         self.spotify.transfer_playback(dev['id'])
         return True
-
-    def stop(self):
-        """ Stop playback. """
-        if not self.spotify:
-            self.dev_id = None
-            self.speak_dialog('NotConnected')
-            return False
-        if not self.spotify.is_playing():
-            self.dev_id = None
-            self.speak_dialog('NotPlaying')
-            LOG.info('Not playing')
-            return False
-        dev = self.get_default_device()
-        if not dev:
-            self.speak_dialog('DeviceNotFound', data={'device':'default'})
-            return False
-        self.dev_id = dev['id']
-        self.pause(None)
-        # Clear playing device id
-        self.dev_id = None
-        return True
-
-    def stop_librespot(self):
-        """ Send Terminate signal to librespot if it's running. """
-        if self.process and self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-            self.process.communicate()  # Communicate to remove zombie
-            self.process = None
-
-    def shutdown(self):
-        """ Remove the monitor at shutdown. """
-        self.cancel_scheduled_event('SpotifyLogin')
-        self.stop_monitor()
-        self.stop_librespot()
-
-        # Do normal shutdown procedure
-        super(SpotifySkill, self).shutdown()
 
 
 def create_skill():
